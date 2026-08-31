@@ -1,0 +1,5 @@
+# `go build` with no -o writes an executable named after the package into the
+# working tree, and one sweeping add later it is in the history of every clone.
+/metal
+cover.out
+coverage.out
