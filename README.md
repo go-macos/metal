@@ -97,6 +97,31 @@ command buffer and returns the GPU's verdict (a second `Wait` returns the same
 verdict). Every `Pending` must be waited on, and memory the work touches must
 not be written, nor read as a result, until its `Wait` has returned.
 
+## Drawing on screen
+
+A `Layer` is a CAMetalLayer. Give `l.ID()` to a view (`-[NSView setLayer:]`
+with `wantsLayer`) and the window server shows whatever is presented to it:
+
+```go
+l, err := dev.NewLayer(w, h)             // drawable size in pixels
+p, err := dev.Present(l, func(e *metal.Encoder, t *metal.Texture) {
+    e.Use(toScreen)
+    e.Buffer(0, frame)
+    e.Texture(0, t)                      // the drawable about to be shown
+    e.Dispatch(w, h)
+})
+err = p.Wait()
+```
+
+- **Wait and commit:** `Present` waits for the layer's next drawable (CoreAnimation blocks up to a second), records the function with that drawable's texture, and commits with the drawable to be shown when the work is done.
+- **Pixel order:** drawables are 8-bit BGRA. A kernel writes `float4` colours in RGBA order to a `texture2d<float, access::write>`, and Metal stores them in the layer's order.
+- **Exact bytes:** a test writes every byte value in every channel through a drawable and reads it back, unchanged.
+- **Settings that differ from CoreAnimation's defaults:**
+  - the device is set, since on macOS it starts nil;
+  - `framebufferOnly` is off, since a framebuffer-only texture cannot be written by a compute kernel.
+- **Resizing:** `Resize` changes the drawable size, up to `MaxLayerSide` (16384) per side.
+- **Errors:** a drawable that never comes is `ErrNoDrawable`.
+
 ## A frame allocates little
 
 One `Run` (command buffer, encoder, pipeline, a buffer, a constant, a

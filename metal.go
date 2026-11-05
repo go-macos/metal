@@ -98,6 +98,57 @@ func (b *Buffer) Bytes() []byte {
 	return b.mem
 }
 
+// ErrNoDrawable is returned by Present when the layer has no drawable to give:
+// all of them are still on their way to the screen after a second's wait, or
+// the layer's settings are not ones CoreAnimation accepts.
+var ErrNoDrawable = errors.New("metal: the layer has no drawable free")
+
+// MaxLayerSide is the largest drawable width or height Resize accepts: the
+// largest 2D texture an Apple GPU makes.
+const MaxLayerSide = 16384
+
+// Layer is a CAMetalLayer: a surface the window server shows, whose frames
+// the GPU draws. Give ID to a view (-[NSView setLayer:]) to put it on screen.
+//
+// Its drawables are 8-bit BGRA. A kernel writes them through a Texture with
+// float4 colours in RGBA order and Metal stores them in the layer's order,
+// so a kernel never swaps channels itself.
+type Layer struct {
+	id   uintptr
+	w, h int
+}
+
+// ID is the CAMetalLayer object, for a view to host.
+func (l *Layer) ID() uintptr {
+	if l == nil {
+		return 0
+	}
+	return l.id
+}
+
+// Size is the drawable size in pixels.
+func (l *Layer) Size() (w, h int) {
+	if l == nil {
+		return 0, 0
+	}
+	return l.w, l.h
+}
+
+// Texture is an image on the GPU. Present hands one over: the drawable that
+// is about to be shown. It is valid only inside that Present's function.
+type Texture struct {
+	id   uintptr
+	w, h int
+}
+
+// Size is the texture size in pixels.
+func (t *Texture) Size() (w, h int) {
+	if t == nil {
+		return 0, 0
+	}
+	return t.w, t.h
+}
+
 // Pending is work sent to the GPU by Submit that may still be running.
 type Pending struct {
 	id  uintptr
