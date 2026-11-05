@@ -23,6 +23,15 @@ func (d *Device) NewBuffer(int) (*Buffer, error) { return nil, ErrUnsupported }
 // Run reports that this platform has no Metal.
 func (d *Device) Run(func(*Encoder)) error { return ErrUnsupported }
 
+// Submit reports that this platform has no Metal.
+func (d *Device) Submit(func(*Encoder)) (*Pending, error) { return nil, ErrUnsupported }
+
+// Done is true: there is never work in flight.
+func (p *Pending) Done() bool { return true }
+
+// Wait returns nil: there is never work in flight.
+func (p *Pending) Wait() error { return nil }
+
 // Close does nothing.
 func (l *Library) Close() {}
 

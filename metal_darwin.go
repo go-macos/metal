@@ -164,10 +164,26 @@ func (b *Buffer) Close() {
 // every way of getting that wrong is a leak or a hang. Here there is no way to
 // hold either past the call.
 func (d *Device) Run(fn func(*Encoder)) error {
-	if d == nil || d.id == 0 {
-		return fmt.Errorf("metal: running against a closed device")
+	p, err := d.Submit(fn)
+	if err != nil {
+		return err
 	}
-	var err error
+	return p.Wait()
+}
+
+// Submit records the work fn describes and sends it, without waiting: the
+// GPU runs it while the caller goes on. Commands on one Device execute in
+// the order they were submitted. Every Pending returned must be Waited on,
+// which also releases the command buffer; memory the work touches must not
+// be written by the CPU, nor read as a result, until Wait has returned.
+func (d *Device) Submit(fn func(*Encoder)) (*Pending, error) {
+	if d == nil || d.id == 0 {
+		return nil, fmt.Errorf("metal: running against a closed device")
+	}
+	var (
+		err error
+		p   *Pending
+	)
 	objc.AutoreleasePool(func() {
 		cb := objc.ID(d.queue).Send(objc.Sel("commandBuffer"))
 		if cb == 0 {
@@ -186,13 +202,52 @@ func (d *Device) Run(fn func(*Encoder)) error {
 			err = e.err
 			return
 		}
+		// The command buffer is autoreleased: keep it past the pool.
+		cb.Send(objc.Sel("retain"))
 		cb.Send(objc.Sel("commit"))
+		p = &Pending{id: uintptr(cb)}
+	})
+	return p, err
+}
+
+// mtlStatusCompleted and mtlStatusError are MTLCommandBufferStatusCompleted
+// and MTLCommandBufferStatusError (MTLCommandBuffer.h): the two states a
+// committed buffer ends in.
+const (
+	mtlStatusCompleted = 4
+	mtlStatusError     = 5
+)
+
+// Done reports, without blocking, whether the GPU has finished the work.
+// Wait must still be called to collect the result.
+func (p *Pending) Done() bool {
+	if p == nil || p.id == 0 {
+		return true
+	}
+	s := objc.ID(p.id).Send(objc.Sel("status"))
+	return s == mtlStatusCompleted || s == mtlStatusError
+}
+
+// Wait blocks until the GPU has finished the work, releases the command
+// buffer and returns the GPU's verdict. Calling it again returns the same
+// verdict at once.
+func (p *Pending) Wait() error {
+	if p == nil {
+		return nil
+	}
+	if p.id == 0 {
+		return p.err
+	}
+	objc.AutoreleasePool(func() {
+		cb := objc.ID(p.id)
 		cb.Send(objc.Sel("waitUntilCompleted"))
 		if nsErr := cb.Send(objc.Sel("error")); nsErr != 0 {
-			err = fmt.Errorf("metal: %s", describe(nsErr, "the GPU refused the work"))
+			p.err = fmt.Errorf("metal: %s", describe(nsErr, "the GPU refused the work"))
 		}
+		cb.Send(objc.Sel("release"))
+		p.id = 0
 	})
-	return err
+	return p.err
 }
 
 // Use selects the kernel the next Dispatch runs.

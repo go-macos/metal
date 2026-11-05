@@ -87,6 +87,16 @@ a closed buffer, asking for four axes — is reported as an error from `Run`, an
 the first complaint is the one you get, because the later ones are usually its
 consequences.
 
+## Submitting without waiting
+
+`Run` is `Submit` followed by `Wait`. `Submit(fn)` encodes and commits, then
+returns a `*Pending` at once, so the CPU can prepare the next frame while the
+GPU draws this one; work on one device runs in submission order.
+`Pending.Done()` polls without blocking; `Pending.Wait()` blocks, releases the
+command buffer and returns the GPU's verdict (a second `Wait` returns the same
+verdict). Every `Pending` must be waited on, and memory the work touches must
+not be written, nor read as a result, until its `Wait` has returned.
+
 ## Kernels must check their own bounds
 
 A grid is dispatched in whole threadgroups, so the last group along an axis
