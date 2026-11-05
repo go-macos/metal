@@ -26,6 +26,23 @@ func (d *Device) Run(func(*Encoder)) error { return ErrUnsupported }
 // Submit reports that this platform has no Metal.
 func (d *Device) Submit(func(*Encoder)) (*Pending, error) { return nil, ErrUnsupported }
 
+// Present reports that this platform has no Metal.
+func (d *Device) Present(*Layer, func(*Encoder, *Texture)) (*Pending, error) {
+	return nil, ErrUnsupported
+}
+
+// NewLayer reports that this platform has no Metal.
+func (d *Device) NewLayer(int, int) (*Layer, error) { return nil, ErrUnsupported }
+
+// Resize reports that this platform has no Metal.
+func (l *Layer) Resize(int, int) error { return ErrUnsupported }
+
+// Close does nothing.
+func (l *Layer) Close() {}
+
+// Texture does nothing.
+func (e *Encoder) Texture(int, *Texture) {}
+
 // Done is true: there is never work in flight.
 func (p *Pending) Done() bool { return true }
 

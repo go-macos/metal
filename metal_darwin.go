@@ -177,6 +177,25 @@ func (d *Device) Run(fn func(*Encoder)) error {
 // which also releases the command buffer; memory the work touches must not
 // be written by the CPU, nor read as a result, until Wait has returned.
 func (d *Device) Submit(fn func(*Encoder)) (*Pending, error) {
+	return d.submit(nil, fn, nil)
+}
+
+// Present is Submit for a layer. It waits for the layer's next drawable
+// (CoreAnimation blocks up to a second for one), records fn with that
+// drawable's texture, and commits with the drawable to be shown once the work
+// is done. The returned Pending is waited on as Submit's is; the texture must
+// not be kept past fn.
+func (d *Device) Present(l *Layer, fn func(*Encoder, *Texture)) (*Pending, error) {
+	if l == nil || l.id == 0 {
+		return nil, fmt.Errorf("metal: presenting to a closed layer")
+	}
+	return d.submit(l, nil, fn)
+}
+
+// submit is Submit and Present. The two functions are passed apart rather
+// than one wrapped in the other, because the wrapping closure would be an
+// allocation on every frame.
+func (d *Device) submit(l *Layer, fn func(*Encoder), present func(*Encoder, *Texture)) (*Pending, error) {
 	if d == nil || d.id == 0 {
 		return nil, fmt.Errorf("metal: running against a closed device")
 	}
@@ -187,6 +206,18 @@ func (d *Device) Submit(fn func(*Encoder)) (*Pending, error) {
 	// Everything sent per frame goes through objc.Msg0..Msg3, not Send: Send
 	// allocates five to seven times per message, and a frame is a few dozen.
 	objc.AutoreleasePool(func() {
+		// The drawable is autoreleased, so it is asked for inside the pool;
+		// the command buffer retains it once it is told to present it.
+		var drawable objc.ID
+		var t *Texture
+		if l != nil {
+			drawable = objc.ID(objc.Msg0(objc.ID(l.id), objc.Sel("nextDrawable")))
+			if drawable == 0 {
+				err = ErrNoDrawable
+				return
+			}
+			t = &Texture{id: objc.Msg0(drawable, objc.Sel("texture")), w: l.w, h: l.h}
+		}
 		cb := objc.ID(objc.Msg0(objc.ID(d.queue), objc.Sel("commandBuffer")))
 		if cb == 0 {
 			err = fmt.Errorf("metal: the queue would not open a command buffer")
@@ -197,12 +228,20 @@ func (d *Device) Submit(fn func(*Encoder)) (*Pending, error) {
 			err = fmt.Errorf("metal: the command buffer would not open a compute encoder")
 			return
 		}
-		fn(e)
+		if t != nil {
+			present(e, t)
+			t.id = 0 // a texture kept past fn is inert
+		} else {
+			fn(e)
+		}
 		objc.Msg0(objc.ID(e.id), objc.Sel("endEncoding"))
 		e.id = 0
 		if e.err != nil {
 			err = e.err
 			return
+		}
+		if drawable != 0 {
+			objc.Msg1(cb, objc.Sel("presentDrawable:"), uintptr(drawable))
 		}
 		// The command buffer is autoreleased: keep it past the pool.
 		objc.Msg0(cb, objc.Sel("retain"))
@@ -272,6 +311,18 @@ func (e *Encoder) Buffer(index int, b *Buffer) {
 		return
 	}
 	objc.Msg3(objc.ID(e.id), objc.Sel("setBuffer:offset:atIndex:"), b.id, 0, uintptr(index))
+}
+
+// Texture binds t at the given texture index of the kernel's signature.
+func (e *Encoder) Texture(index int, t *Texture) {
+	if e.id == 0 {
+		return
+	}
+	if t == nil || t.id == 0 {
+		e.fail(fmt.Errorf("metal: texture %d is missing or used outside its Present", index))
+		return
+	}
+	objc.Msg2(objc.ID(e.id), objc.Sel("setTexture:atIndex:"), t.id, uintptr(index))
 }
 
 // setConstant is the untyped half of Constant, kept here so the generic
