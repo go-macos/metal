@@ -97,6 +97,14 @@ command buffer and returns the GPU's verdict (a second `Wait` returns the same
 verdict). Every `Pending` must be waited on, and memory the work touches must
 not be written, nor read as a result, until its `Wait` has returned.
 
+## A frame allocates little
+
+One `Run` (command buffer, encoder, pipeline, a buffer, a constant, a
+dispatch, commit and wait) costs 22 allocations, down from 100. Every message
+sent per frame goes through go-macos/objc's `Msg0`–`Msg3`, which cost one
+allocation each, rather than `ID.Send`'s reflective path, which costs five to
+seven. `TestAFrameAllocatesLittle` holds the count.
+
 ## Kernels must check their own bounds
 
 A grid is dispatched in whole threadgroups, so the last group along an axis
