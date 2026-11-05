@@ -184,27 +184,29 @@ func (d *Device) Submit(fn func(*Encoder)) (*Pending, error) {
 		err error
 		p   *Pending
 	)
+	// Everything sent per frame goes through objc.Msg0..Msg3, not Send: Send
+	// allocates five to seven times per message, and a frame is a few dozen.
 	objc.AutoreleasePool(func() {
-		cb := objc.ID(d.queue).Send(objc.Sel("commandBuffer"))
+		cb := objc.ID(objc.Msg0(objc.ID(d.queue), objc.Sel("commandBuffer")))
 		if cb == 0 {
 			err = fmt.Errorf("metal: the queue would not open a command buffer")
 			return
 		}
-		e := &Encoder{id: uintptr(cb.Send(objc.Sel("computeCommandEncoder")))}
+		e := &Encoder{id: objc.Msg0(cb, objc.Sel("computeCommandEncoder"))}
 		if e.id == 0 {
 			err = fmt.Errorf("metal: the command buffer would not open a compute encoder")
 			return
 		}
 		fn(e)
-		objc.ID(e.id).Send(objc.Sel("endEncoding"))
+		objc.Msg0(objc.ID(e.id), objc.Sel("endEncoding"))
 		e.id = 0
 		if e.err != nil {
 			err = e.err
 			return
 		}
 		// The command buffer is autoreleased: keep it past the pool.
-		cb.Send(objc.Sel("retain"))
-		cb.Send(objc.Sel("commit"))
+		objc.Msg0(cb, objc.Sel("retain"))
+		objc.Msg0(cb, objc.Sel("commit"))
 		p = &Pending{id: uintptr(cb)}
 	})
 	return p, err
@@ -224,7 +226,7 @@ func (p *Pending) Done() bool {
 	if p == nil || p.id == 0 {
 		return true
 	}
-	s := objc.ID(p.id).Send(objc.Sel("status"))
+	s := objc.Msg0(objc.ID(p.id), objc.Sel("status"))
 	return s == mtlStatusCompleted || s == mtlStatusError
 }
 
@@ -240,11 +242,11 @@ func (p *Pending) Wait() error {
 	}
 	objc.AutoreleasePool(func() {
 		cb := objc.ID(p.id)
-		cb.Send(objc.Sel("waitUntilCompleted"))
-		if nsErr := cb.Send(objc.Sel("error")); nsErr != 0 {
+		objc.Msg0(cb, objc.Sel("waitUntilCompleted"))
+		if nsErr := objc.ID(objc.Msg0(cb, objc.Sel("error"))); nsErr != 0 {
 			p.err = fmt.Errorf("metal: %s", describe(nsErr, "the GPU refused the work"))
 		}
-		cb.Send(objc.Sel("release"))
+		objc.Msg0(cb, objc.Sel("release"))
 		p.id = 0
 	})
 	return p.err
@@ -257,7 +259,7 @@ func (e *Encoder) Use(p *Pipeline) {
 		return
 	}
 	e.pipe = p
-	objc.ID(e.id).Send(objc.Sel("setComputePipelineState:"), objc.ID(p.id))
+	objc.Msg1(objc.ID(e.id), objc.Sel("setComputePipelineState:"), p.id)
 }
 
 // Buffer binds b at the given buffer index of the kernel's signature.
@@ -269,7 +271,7 @@ func (e *Encoder) Buffer(index int, b *Buffer) {
 		e.fail(fmt.Errorf("metal: buffer %d is closed or missing", index))
 		return
 	}
-	objc.ID(e.id).Send(objc.Sel("setBuffer:offset:atIndex:"), objc.ID(b.id), uintptr(0), uintptr(index))
+	objc.Msg3(objc.ID(e.id), objc.Sel("setBuffer:offset:atIndex:"), b.id, 0, uintptr(index))
 }
 
 // setConstant is the untyped half of Constant, kept here so the generic
@@ -278,7 +280,7 @@ func (e *Encoder) setConstant(index int, p unsafe.Pointer, size uintptr) {
 	if e.id == 0 {
 		return
 	}
-	objc.ID(e.id).Send(objc.Sel("setBytes:length:atIndex:"), p, size, uintptr(index))
+	objc.Msg3(objc.ID(e.id), objc.Sel("setBytes:length:atIndex:"), uintptr(p), size, uintptr(index))
 }
 
 // mtlSize is Metal's three-axis size. It is 24 bytes, and arm64 passes a
@@ -304,8 +306,8 @@ func (e *Encoder) Dispatch(dims ...int) {
 	groups := groupsFor(grid, group)
 	tg := mtlSize{uint64(groups[0]), uint64(groups[1]), uint64(groups[2])}
 	per := mtlSize{uint64(group[0]), uint64(group[1]), uint64(group[2])}
-	objc.ID(e.id).Send(objc.Sel("dispatchThreadgroups:threadsPerThreadgroup:"),
-		unsafe.Pointer(&tg), unsafe.Pointer(&per))
+	objc.Msg2(objc.ID(e.id), objc.Sel("dispatchThreadgroups:threadsPerThreadgroup:"),
+		uintptr(unsafe.Pointer(&tg)), uintptr(unsafe.Pointer(&per)))
 }
 
 func describe(nsErr objc.ID, fallback string) string {
