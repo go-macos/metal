@@ -215,3 +215,70 @@ func TestAFailureWithNoNSErrorStillSaysSomething(t *testing.T) {
 		t.Fatalf("describe(0) = %q", got)
 	}
 }
+
+func TestSubmitReturnsBeforeTheWorkIsCollectedAndWaitDeliversIt(t *testing.T) {
+	d := device(t)
+	lib, err := d.Compile(testSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lib.Close()
+	pipe, err := lib.Pipeline("bump")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipe.Close()
+	const n = 1 << 16
+	buf, err := d.NewBuffer(n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.Close()
+	p := testParams{N: n, Add: 1}
+	// Three submissions in flight at once run in submission order: the sum
+	// proves all three ran, each exactly once.
+	var pend []*Pending
+	for range 3 {
+		pd, err := d.Submit(func(e *Encoder) {
+			e.Use(pipe)
+			e.Buffer(0, buf)
+			Constant(e, 1, &p)
+			e.Dispatch(n)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		pend = append(pend, pd)
+	}
+	for _, pd := range pend {
+		if err := pd.Wait(); err != nil {
+			t.Fatal(err)
+		}
+		if !pd.Done() {
+			t.Error("a Waited Pending is not Done")
+		}
+		if err := pd.Wait(); err != nil { // a second Wait is harmless
+			t.Fatal(err)
+		}
+	}
+	for i, v := range buf.Bytes() {
+		if v != 3 {
+			t.Fatalf("byte %d = %d, want 3", i, v)
+		}
+	}
+}
+
+func TestSubmitRefusesWhatRunRefusesAndNilPendingIsInert(t *testing.T) {
+	d := device(t)
+	if pd, err := d.Submit(func(e *Encoder) { e.Dispatch(16) }); err == nil || pd != nil {
+		t.Fatalf("a bad encoding was submitted: %v %v", pd, err)
+	}
+	var none *Pending
+	if !none.Done() || none.Wait() != nil {
+		t.Error("a nil Pending is not inert")
+	}
+	d.Close()
+	if pd, err := d.Submit(func(*Encoder) {}); err == nil || pd != nil {
+		t.Error("a closed device accepted work")
+	}
+}

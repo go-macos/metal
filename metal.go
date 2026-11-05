@@ -98,6 +98,12 @@ func (b *Buffer) Bytes() []byte {
 	return b.mem
 }
 
+// Pending is work sent to the GPU by Submit that may still be running.
+type Pending struct {
+	id  uintptr
+	err error
+}
+
 // Encoder records the work of a single submission.
 type Encoder struct {
 	id   uintptr
