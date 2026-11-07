@@ -33,34 +33,69 @@ func loadMetal() error {
 }
 
 // Default is the GPU macOS would pick for itself.
+//
+// Runs inside objc.AutoreleasePool, like every other function in this file
+// that sends an Objective-C message outside the per-frame submit/Wait pair
+// below. Every one of them used NOT to: the gap went unnoticed because a
+// single goroutine issuing these calls one at a time, on whichever OS
+// thread happened to run it, almost always keeps running there long enough
+// for nothing to notice — until two or more goroutines call Default/
+// Compile/NewBuffer/Close concurrently (a real shape: one GPUDevice per
+// Worker, go-wasmcontainers' own confirmed usage) and Go's scheduler moves
+// one of them to a different OS thread mid-call. objc.AutoreleasePool's own
+// doc comment names the exact failure this causes — "a SIGSEGV inside
+// objc_autoreleasePoolPop, at a program counter with nothing of this
+// package on the stack" — which matches a native crash go-wasmcontainers
+// reported running several Workers' own GPU calls concurrently
+// (runtime.sigpanic at a dylib PC, the Go runtime's own crash report then
+// failing to unwind the foreign frame). Not reproduced in an isolated
+// stress test on this machine (48 goroutines × 2,000 ops, with concurrent
+// GC pressure) — the race window may need a shape this test did not hit,
+// or conditions specific to their own environment — but every one of
+// these calls was genuinely unprotected regardless, matching a documented,
+// already-fixed-once-before bug class in this fleet's own objc package,
+// and Apple's own Metal docs state no thread-safety guarantee for
+// MTLDevice's resource-creation methods (only MTLCommandQueue is
+// documented thread-safe) — so this is a real gap closed on the evidence
+// available, not a fix contingent on reproducing their exact crash.
 func Default() (*Device, error) {
 	if err := loadMetal(); err != nil {
 		return nil, err
 	}
-	id := objc.ID(createDevice())
-	if id == 0 {
-		return nil, ErrNoDevice
-	}
-	queue := id.Send(objc.Sel("newCommandQueue"))
-	if queue == 0 {
-		id.Send(objc.Sel("release"))
-		return nil, fmt.Errorf("metal: %s would not open a command queue", objc.Stringify(id.Send(objc.Sel("name"))))
-	}
-	return &Device{
-		id:      uintptr(id),
-		queue:   uintptr(queue),
-		name:    objc.Stringify(id.Send(objc.Sel("name"))),
-		unified: id.Send(objc.Sel("hasUnifiedMemory")) != 0,
-	}, nil
+	var dev *Device
+	var err error
+	objc.AutoreleasePool(func() {
+		id := objc.ID(createDevice())
+		if id == 0 {
+			err = ErrNoDevice
+			return
+		}
+		queue := id.Send(objc.Sel("newCommandQueue"))
+		if queue == 0 {
+			id.Send(objc.Sel("release"))
+			err = fmt.Errorf("metal: %s would not open a command queue", objc.Stringify(id.Send(objc.Sel("name"))))
+			return
+		}
+		dev = &Device{
+			id:      uintptr(id),
+			queue:   uintptr(queue),
+			name:    objc.Stringify(id.Send(objc.Sel("name"))),
+			unified: id.Send(objc.Sel("hasUnifiedMemory")) != 0,
+		}
+	})
+	return dev, err
 }
 
-// Close gives the GPU back.
+// Close gives the GPU back. See Default's own doc comment for why this
+// (like every other function here) now runs inside objc.AutoreleasePool.
 func (d *Device) Close() {
 	if d == nil || d.id == 0 {
 		return
 	}
-	objc.ID(d.queue).Send(objc.Sel("release"))
-	objc.ID(d.id).Send(objc.Sel("release"))
+	objc.AutoreleasePool(func() {
+		objc.ID(d.queue).Send(objc.Sel("release"))
+		objc.ID(d.id).Send(objc.Sel("release"))
+	})
 	d.id, d.queue = 0, 0
 }
 
@@ -69,61 +104,86 @@ func (d *Device) Close() {
 // A kernel that will not compile says WHY, in the compiler's own words. That
 // is worth the out-parameter dance below: a shader error reported as "it did
 // not work" costs an afternoon.
+//
+// Runs inside objc.AutoreleasePool — see Default's own doc comment — which
+// matters doubly here: the `error:` out-parameter convention hands back an
+// AUTORELEASED NSError, exactly the kind of object this file's own pool
+// discipline exists to own correctly.
 func (d *Device) Compile(source string) (*Library, error) {
 	if d == nil || d.id == 0 {
 		return nil, fmt.Errorf("metal: compiling against a closed device")
 	}
-	var nsErr objc.ID
-	lib := objc.ID(d.id).Send(objc.Sel("newLibraryWithSource:options:error:"),
-		objc.NSString(source), objc.ID(0), unsafe.Pointer(&nsErr))
-	if lib == 0 {
-		return nil, fmt.Errorf("metal: %s", describe(nsErr, "the kernel source would not compile"))
-	}
-	return &Library{id: uintptr(lib), dev: d}, nil
+	var lib *Library
+	var err error
+	objc.AutoreleasePool(func() {
+		var nsErr objc.ID
+		l := objc.ID(d.id).Send(objc.Sel("newLibraryWithSource:options:error:"),
+			objc.NSString(source), objc.ID(0), unsafe.Pointer(&nsErr))
+		if l == 0 {
+			err = fmt.Errorf("metal: %s", describe(nsErr, "the kernel source would not compile"))
+			return
+		}
+		lib = &Library{id: uintptr(l), dev: d}
+	})
+	return lib, err
 }
 
-// Close releases the compiled kernels.
+// Close releases the compiled kernels. See Default's own doc comment.
 func (l *Library) Close() {
 	if l == nil || l.id == 0 {
 		return
 	}
-	objc.ID(l.id).Send(objc.Sel("release"))
+	objc.AutoreleasePool(func() {
+		objc.ID(l.id).Send(objc.Sel("release"))
+	})
 	l.id = 0
 }
 
-// Pipeline prepares one kernel function of the library for dispatch.
+// Pipeline prepares one kernel function of the library for dispatch. See
+// Default's own doc comment for why this runs inside objc.AutoreleasePool
+// (the `error:` out-parameter here is autoreleased too).
 func (l *Library) Pipeline(name string) (*Pipeline, error) {
 	if l == nil || l.id == 0 {
 		return nil, fmt.Errorf("metal: taking a pipeline from a closed library")
 	}
-	fn := objc.ID(l.id).Send(objc.Sel("newFunctionWithName:"), objc.NSString(name))
-	if fn == 0 {
-		return nil, fmt.Errorf("metal: this library has no kernel called %q", name)
-	}
-	defer fn.Send(objc.Sel("release"))
-	var nsErr objc.ID
-	p := objc.ID(l.dev.id).Send(objc.Sel("newComputePipelineStateWithFunction:error:"),
-		fn, unsafe.Pointer(&nsErr))
-	if p == 0 {
-		return nil, fmt.Errorf("metal: %s", describe(nsErr, "kernel "+name+" would not become a pipeline"))
-	}
-	return &Pipeline{
-		id:    uintptr(p),
-		width: int(p.Send(objc.Sel("threadExecutionWidth"))),
-		max:   int(p.Send(objc.Sel("maxTotalThreadsPerThreadgroup"))),
-	}, nil
+	var pipe *Pipeline
+	var err error
+	objc.AutoreleasePool(func() {
+		fn := objc.ID(l.id).Send(objc.Sel("newFunctionWithName:"), objc.NSString(name))
+		if fn == 0 {
+			err = fmt.Errorf("metal: this library has no kernel called %q", name)
+			return
+		}
+		defer fn.Send(objc.Sel("release"))
+		var nsErr objc.ID
+		p := objc.ID(l.dev.id).Send(objc.Sel("newComputePipelineStateWithFunction:error:"),
+			fn, unsafe.Pointer(&nsErr))
+		if p == 0 {
+			err = fmt.Errorf("metal: %s", describe(nsErr, "kernel "+name+" would not become a pipeline"))
+			return
+		}
+		pipe = &Pipeline{
+			id:    uintptr(p),
+			width: int(p.Send(objc.Sel("threadExecutionWidth"))),
+			max:   int(p.Send(objc.Sel("maxTotalThreadsPerThreadgroup"))),
+		}
+	})
+	return pipe, err
 }
 
-// Close releases the pipeline.
+// Close releases the pipeline. See Default's own doc comment.
 func (p *Pipeline) Close() {
 	if p == nil || p.id == 0 {
 		return
 	}
-	objc.ID(p.id).Send(objc.Sel("release"))
+	objc.AutoreleasePool(func() {
+		objc.ID(p.id).Send(objc.Sel("release"))
+	})
 	p.id = 0
 }
 
-// NewBuffer allocates n bytes both processors can read.
+// NewBuffer allocates n bytes both processors can read. See Default's own
+// doc comment for why this runs inside objc.AutoreleasePool.
 func (d *Device) NewBuffer(n int) (*Buffer, error) {
 	if d == nil || d.id == 0 {
 		return nil, fmt.Errorf("metal: allocating against a closed device")
@@ -131,29 +191,40 @@ func (d *Device) NewBuffer(n int) (*Buffer, error) {
 	if n < 1 {
 		return nil, fmt.Errorf("metal: a buffer of %d bytes", n)
 	}
-	b := objc.ID(d.id).Send(objc.Sel("newBufferWithLength:options:"), uintptr(n), uintptr(0))
-	if b == 0 {
-		return nil, fmt.Errorf("metal: the GPU would not give %d bytes", n)
-	}
-	// Asked for as an unsafe.Pointer rather than an integer: a uintptr that
-	// becomes a pointer again is what go vet warns about, and it is right to --
-	// between the two conversions the collector is entitled to move whatever
-	// it referred to. Metal memory does not move, but the way to say that is
-	// to never let it be an integer in the first place.
-	mem := objc.Send[unsafe.Pointer](b, objc.Sel("contents"))
-	if mem == nil {
-		b.Send(objc.Sel("release"))
-		return nil, fmt.Errorf("metal: a buffer of %d bytes the CPU cannot see", n)
-	}
-	return &Buffer{id: uintptr(b), mem: unsafe.Slice((*byte)(mem), n)}, nil
+	var buf *Buffer
+	var err error
+	objc.AutoreleasePool(func() {
+		b := objc.ID(d.id).Send(objc.Sel("newBufferWithLength:options:"), uintptr(n), uintptr(0))
+		if b == 0 {
+			err = fmt.Errorf("metal: the GPU would not give %d bytes", n)
+			return
+		}
+		// Asked for as an unsafe.Pointer rather than an integer: a uintptr
+		// that becomes a pointer again is what go vet warns about, and it
+		// is right to -- between the two conversions the collector is
+		// entitled to move whatever it referred to. Metal memory does not
+		// move, but the way to say that is to never let it be an integer
+		// in the first place.
+		mem := objc.Send[unsafe.Pointer](b, objc.Sel("contents"))
+		if mem == nil {
+			b.Send(objc.Sel("release"))
+			err = fmt.Errorf("metal: a buffer of %d bytes the CPU cannot see", n)
+			return
+		}
+		buf = &Buffer{id: uintptr(b), mem: unsafe.Slice((*byte)(mem), n)}
+	})
+	return buf, err
 }
 
-// Close releases the memory. Bytes taken before this must not be used after.
+// Close releases the memory. Bytes taken before this must not be used
+// after. See Default's own doc comment.
 func (b *Buffer) Close() {
 	if b == nil || b.id == 0 {
 		return
 	}
-	objc.ID(b.id).Send(objc.Sel("release"))
+	objc.AutoreleasePool(func() {
+		objc.ID(b.id).Send(objc.Sel("release"))
+	})
 	b.id, b.mem = 0, nil
 }
 
