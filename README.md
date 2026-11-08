@@ -75,6 +75,13 @@ hands back a Go slice over the very bytes the GPU reads. Writing into it *is*
 the upload; reading out of it after `Run` *is* the download. The copy that
 usually eats a GPU's advantage on small work never happens at all.
 
+## Binding a sub-range
+
+`Buffer(index, b)` binds the whole of `b`. Several bindings can share one
+real allocation at disjoint sub-ranges with `BufferAt(index, b, offset)` —
+`Buffer` is `BufferAt(index, b, 0)`. An offset outside `b`'s own length is
+reported as an error from `Run`, the same way a closed or missing buffer is.
+
 ## The scope is the API
 
 A Metal command buffer and its encoder are autoreleased objects with an order
