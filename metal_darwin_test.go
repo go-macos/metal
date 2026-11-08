@@ -83,6 +83,55 @@ func TestAKernelActuallyRunsAndTheArithmeticIsRight(t *testing.T) {
 	}
 }
 
+// TestBufferAtBindsASubRangeNotTheWholeBuffer is the decisive positive for
+// BufferAt: binding at a non-zero offset must make the kernel see (and
+// touch) only the bytes from that offset on, leaving everything before it
+// alone. Buffer(0, buf) on the whole 32 bytes would also pass a test that
+// only checked "did it run" — the kernel must stop at the HALFWAY point.
+func TestBufferAtBindsASubRangeNotTheWholeBuffer(t *testing.T) {
+	d := device(t)
+	lib, err := d.Compile(testSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lib.Close()
+	pipe, err := lib.Pipeline("bump")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pipe.Close()
+
+	const total, offset, n = 32, 16, 16
+	buf, err := d.NewBuffer(total)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer buf.Close()
+	mem := buf.Bytes()
+	for i := range mem {
+		mem[i] = byte(i)
+	}
+	p := testParams{N: n, Add: 7}
+	if err := d.Run(func(e *Encoder) {
+		e.Use(pipe)
+		e.BufferAt(0, buf, offset)
+		Constant(e, 1, &p)
+		e.Dispatch(n)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < offset; i++ {
+		if want := byte(i); mem[i] != want {
+			t.Errorf("byte %d (before the bound range) = %d, want untouched %d", i, mem[i], want)
+		}
+	}
+	for i := offset; i < total; i++ {
+		if want := byte(i) + 7; mem[i] != want {
+			t.Errorf("byte %d (inside the bound range) = %d, want %d", i, mem[i], want)
+		}
+	}
+}
+
 func TestABrokenKernelSaysWhatIsWrongWithIt(t *testing.T) {
 	d := device(t)
 	_, err := d.Compile("kernel void nope(") // not close to valid
@@ -125,6 +174,12 @@ func TestTheBindingRefusesWhatItCannotDo(t *testing.T) {
 		t.Error("a closed buffer still hands out memory")
 	}
 
+	small, err := d.NewBuffer(16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer small.Close()
+
 	for _, tc := range []struct {
 		name string
 		fn   func(*Encoder)
@@ -133,6 +188,8 @@ func TestTheBindingRefusesWhatItCannotDo(t *testing.T) {
 		{"four axes", func(e *Encoder) { e.Use(pipe); e.Dispatch(1, 2, 3, 4) }},
 		{"a closed buffer", func(e *Encoder) { e.Use(pipe); e.Buffer(0, closed); e.Dispatch(16) }},
 		{"no buffer at all", func(e *Encoder) { e.Use(pipe); e.Buffer(0, nil); e.Dispatch(16) }},
+		{"an offset past the end", func(e *Encoder) { e.Use(pipe); e.BufferAt(0, small, 17); e.Dispatch(16) }},
+		{"a negative offset", func(e *Encoder) { e.Use(pipe); e.BufferAt(0, small, -1); e.Dispatch(16) }},
 		{"no pipeline at all", func(e *Encoder) { e.Use(nil) }},
 		{"nothing to pass", func(e *Encoder) { e.Use(pipe); Constant[testParams](e, 1, nil) }},
 	} {
