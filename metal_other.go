@@ -67,6 +67,9 @@ func (e *Encoder) Use(*Pipeline) {}
 // Buffer does nothing.
 func (e *Encoder) Buffer(int, *Buffer) {}
 
+// BufferAt does nothing.
+func (e *Encoder) BufferAt(int, *Buffer, int) {}
+
 // Dispatch does nothing.
 func (e *Encoder) Dispatch(...int) {}
 

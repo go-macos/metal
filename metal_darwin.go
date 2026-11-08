@@ -373,7 +373,18 @@ func (e *Encoder) Use(p *Pipeline) {
 }
 
 // Buffer binds b at the given buffer index of the kernel's signature.
+// BufferAt(index, b, 0) does the same thing.
 func (e *Encoder) Buffer(index int, b *Buffer) {
+	e.BufferAt(index, b, 0)
+}
+
+// BufferAt binds b at the given buffer index of the kernel's signature,
+// starting offset bytes into b: the kernel's own buffer(index) pointer
+// reads and writes b.Bytes()[offset:], not b.Bytes()[0:]. Lets several
+// bindings share one real allocation at disjoint sub-ranges (WebGPU's
+// GPUBufferBinding.offset, go-webengine/engine's own caller) instead of
+// needing one *Buffer per binding.
+func (e *Encoder) BufferAt(index int, b *Buffer, offset int) {
 	if e.id == 0 {
 		return
 	}
@@ -381,7 +392,11 @@ func (e *Encoder) Buffer(index int, b *Buffer) {
 		e.fail(fmt.Errorf("metal: buffer %d is closed or missing", index))
 		return
 	}
-	objc.Msg3(objc.ID(e.id), objc.Sel("setBuffer:offset:atIndex:"), b.id, 0, uintptr(index))
+	if offset < 0 || offset > len(b.mem) {
+		e.fail(fmt.Errorf("metal: buffer %d offset %d is out of range for a %d-byte buffer", index, offset, len(b.mem)))
+		return
+	}
+	objc.Msg3(objc.ID(e.id), objc.Sel("setBuffer:offset:atIndex:"), b.id, uintptr(offset), uintptr(index))
 }
 
 // Texture binds t at the given texture index of the kernel's signature.
