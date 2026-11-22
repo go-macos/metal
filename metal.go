@@ -135,10 +135,12 @@ func (l *Layer) Size() (w, h int) {
 }
 
 // Texture is an image on the GPU. Present hands one over: the drawable that
-// is about to be shown. It is valid only inside that Present's function.
+// is about to be shown, valid only inside that Present's function and never
+// Closed. NewTexture makes one the caller owns outright, good until Close.
 type Texture struct {
-	id   uintptr
-	w, h int
+	id     uintptr
+	w, h   int
+	format PixelFormat
 }
 
 // Size is the texture size in pixels.
@@ -147,6 +149,124 @@ func (t *Texture) Size() (w, h int) {
 		return 0, 0
 	}
 	return t.w, t.h
+}
+
+// PixelFormat selects a texture's channel layout and bit width. Values match
+// MTLPixelFormat's own numbering (Metal's MTLPixelFormat.h) directly, so
+// nothing here translates between this type and the framework's enum.
+type PixelFormat int
+
+// PixelFormatR8Uint is one unsigned 8-bit integer channel: WebGPU's
+// "r8uint", the only format go-webengine/engine's render path needs so far
+// (go-webengine/engine#415) -- its shaders write and read an integer
+// colour, never a normalised one.
+const PixelFormatR8Uint PixelFormat = 13
+
+// TextureUsage is a set of ways a texture may be used, OR'd together. There
+// is no bit for copying: Metal lets Replace and GetBytes, or a blit, touch
+// any texture regardless of usage, so WebGPU's COPY_SRC/COPY_DST have no
+// counterpart here.
+type TextureUsage uint
+
+const (
+	// TextureUsageShaderRead lets a shader sample or textureLoad the texture.
+	TextureUsageShaderRead TextureUsage = 0x1
+	// TextureUsageShaderWrite lets a compute kernel write the texture
+	// directly, outside a render pass.
+	TextureUsageShaderWrite TextureUsage = 0x2
+	// TextureUsageRenderTarget lets a render pass draw into the texture.
+	TextureUsageRenderTarget TextureUsage = 0x4
+)
+
+// VertexFormat is one vertex attribute's element type and count. Values
+// match MTLVertexFormat's own numbering (MTLVertexDescriptor.h) directly.
+type VertexFormat int
+
+const (
+	VertexFormatFloat32x2 VertexFormat = 29 // MTLVertexFormatFloat2
+	VertexFormatFloat32x3 VertexFormat = 30 // MTLVertexFormatFloat3
+	VertexFormatUint32    VertexFormat = 36 // MTLVertexFormatUInt
+	VertexFormatUint32x4  VertexFormat = 39 // MTLVertexFormatUInt4
+)
+
+// VertexAttribute is one value a vertex shader reads out of a vertex
+// buffer: its element format, its byte offset within one vertex, and which
+// buffer index (the index RenderEncoder.VertexBuffer binds) it comes from.
+// Index is the shader's own [[attribute(Index)]].
+type VertexAttribute struct {
+	Index       int
+	Format      VertexFormat
+	Offset      int
+	BufferIndex int
+}
+
+// VertexLayout is one vertex buffer's stride: the byte distance from the
+// start of one vertex's data to the start of the next, for the buffer at
+// BufferIndex -- the shader's own [[buffer(BufferIndex)]].
+type VertexLayout struct {
+	BufferIndex int
+	Stride      int
+}
+
+// RenderPipelineDescriptor is what Library.RenderPipeline needs to build a
+// pipeline: the vertex and fragment entry points it compiles from the
+// library's own source, how vertex buffers feed the vertex stage, and the
+// one color target's format. There is no depth attachment and no sampler
+// state: go-webengine/engine's render path (go-webengine/engine#415) needs
+// neither yet.
+type RenderPipelineDescriptor struct {
+	VertexFunction   string
+	FragmentFunction string
+	Attributes       []VertexAttribute
+	Layouts          []VertexLayout
+	ColorFormat      PixelFormat
+}
+
+// RenderPipeline is a vertex and fragment function pair, compiled and ready
+// to draw with.
+type RenderPipeline struct {
+	id uintptr
+}
+
+// LoadAction is what a render pass does to its target before the first draw.
+type LoadAction int
+
+const (
+	LoadActionDontCare LoadAction = 0 // MTLLoadActionDontCare
+	LoadActionLoad     LoadAction = 1 // MTLLoadActionLoad: keep what is there
+	LoadActionClear    LoadAction = 2 // MTLLoadActionClear: start from Clear
+)
+
+// StoreAction is what a render pass does to its target after the last draw.
+type StoreAction int
+
+const (
+	StoreActionDontCare StoreAction = 0 // MTLStoreActionDontCare
+	StoreActionStore    StoreAction = 1 // MTLStoreActionStore: keep the result
+)
+
+// RenderPassDescriptor is what Device.RunRender needs to open a render
+// pass: the texture it draws into, and the load/store behaviour around it.
+// Clear is read only when Load is LoadActionClear.
+type RenderPassDescriptor struct {
+	Target *Texture
+	Load   LoadAction
+	Store  StoreAction
+	Clear  [4]float64
+}
+
+// RenderEncoder records the draws of a single render pass.
+type RenderEncoder struct {
+	id   uintptr
+	pipe *RenderPipeline
+	err  error
+}
+
+// fail keeps the FIRST complaint. See Encoder.fail's own doc comment.
+func (e *RenderEncoder) fail(err error) {
+	if e.err == nil {
+		e.err = err
+	}
 }
 
 // Pending is work sent to the GPU by Submit that may still be running.
