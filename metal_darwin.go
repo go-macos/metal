@@ -490,6 +490,20 @@ func checkTextureSize(w, h int) error {
 	return nil
 }
 
+// newTextureDescriptor is a seam so a test can force NewTexture's
+// describe-failure branch without the system ever actually refusing one.
+var newTextureDescriptor = func(format PixelFormat, w, h int) objc.ID {
+	return objc.ClassID("MTLTextureDescriptor").Send(
+		objc.Sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+		uintptr(format), uintptr(w), uintptr(h), uintptr(0))
+}
+
+// newTextureFromDescriptor is a seam so a test can force NewTexture's
+// allocation-failure branch without the GPU ever actually refusing one.
+var newTextureFromDescriptor = func(device, desc objc.ID) objc.ID {
+	return device.Send(objc.Sel("newTextureWithDescriptor:"), desc)
+}
+
 // NewTexture allocates a 2D texture the GPU can render into, read in a
 // shader, or both, depending on usage. Its storage mode is always Shared:
 // every device this package opens has unified memory (see UnifiedMemory),
@@ -509,16 +523,14 @@ func (d *Device) NewTexture(w, h int, format PixelFormat, usage TextureUsage) (*
 	}
 	var tex *Texture
 	objc.AutoreleasePool(func() {
-		desc := objc.ClassID("MTLTextureDescriptor").Send(
-			objc.Sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
-			uintptr(format), uintptr(w), uintptr(h), uintptr(0))
+		desc := newTextureDescriptor(format, w, h)
 		if desc == 0 {
 			err = fmt.Errorf("metal: the system would not describe a %d x %d texture", w, h)
 			return
 		}
 		desc.Send(objc.Sel("setUsage:"), uintptr(usage))
 		desc.Send(objc.Sel("setStorageMode:"), uintptr(mtlStorageModeShared))
-		t := objc.ID(d.id).Send(objc.Sel("newTextureWithDescriptor:"), desc)
+		t := newTextureFromDescriptor(objc.ID(d.id), desc)
 		if t == 0 {
 			err = fmt.Errorf("metal: the GPU would not give a %d x %d texture", w, h)
 			return
@@ -650,6 +662,18 @@ func (p *RenderPipeline) Close() {
 	p.id = 0
 }
 
+// newRenderCommandBuffer is a seam so a test can force RunRender's
+// command-buffer failure branch without the queue ever actually refusing one.
+var newRenderCommandBuffer = func(queue uintptr) objc.ID {
+	return objc.ID(objc.Msg0(objc.ID(queue), objc.Sel("commandBuffer")))
+}
+
+// newRenderEncoder is a seam so a test can force RunRender's encoder-failure
+// branch without the command buffer ever actually refusing one.
+var newRenderEncoder = func(cb, rpd objc.ID) objc.ID {
+	return cb.Send(objc.Sel("renderCommandEncoderWithDescriptor:"), rpd)
+}
+
 // RunRender opens a render pass against desc.Target, records the draws fn
 // describes, and waits for the GPU to finish. Run's own doc comment about
 // scope applies identically: encode, end, commit, wait, with no way to hold
@@ -674,12 +698,12 @@ func (d *Device) RunRender(desc RenderPassDescriptor, fn func(*RenderEncoder)) e
 			ca0.Send(objc.Sel("setClearColor:"), cc)
 		}
 
-		cb := objc.ID(objc.Msg0(objc.ID(d.queue), objc.Sel("commandBuffer")))
+		cb := newRenderCommandBuffer(d.queue)
 		if cb == 0 {
 			err = fmt.Errorf("metal: the queue would not open a command buffer")
 			return
 		}
-		re := cb.Send(objc.Sel("renderCommandEncoderWithDescriptor:"), rpd)
+		re := newRenderEncoder(cb, rpd)
 		if re == 0 {
 			err = fmt.Errorf("metal: the command buffer would not open a render encoder")
 			return

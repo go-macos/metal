@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"unsafe"
+
+	"github.com/go-macos/objc"
 )
 
 // renderSource is the vertex/fragment pair every render test below compiles.
@@ -521,6 +523,83 @@ func TestRenderAndTextureAPIsRefuseWhatTheyCannotDo(t *testing.T) {
 	escaped.Use(pipe)
 	if escaped.err == nil {
 		t.Error("Use on an escaped encoder")
+	}
+}
+
+// TestNewTextureSeamFailures drives NewTexture's two describe/allocate
+// failure branches through their seams: on real hardware neither
+// MTLTextureDescriptor nor newTextureWithDescriptor: ever actually returns
+// nil for a valid, size-checked request, so there is no parameter
+// combination that reaches these lines honestly. The seam forces exactly
+// the native call failing, same as usb_darwin_test.go's dlopen seam.
+func TestNewTextureSeamFailures(t *testing.T) {
+	d := device(t)
+
+	t.Run("descriptor creation refused", func(t *testing.T) {
+		old := newTextureDescriptor
+		t.Cleanup(func() { newTextureDescriptor = old })
+		newTextureDescriptor = func(PixelFormat, int, int) objc.ID { return 0 }
+		_, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageShaderRead)
+		if err == nil || !strings.Contains(err.Error(), "would not describe") {
+			t.Errorf("NewTexture with the descriptor seam forced to fail: err = %v, want \"would not describe\"", err)
+		}
+	})
+
+	t.Run("allocation refused", func(t *testing.T) {
+		old := newTextureFromDescriptor
+		t.Cleanup(func() { newTextureFromDescriptor = old })
+		newTextureFromDescriptor = func(objc.ID, objc.ID) objc.ID { return 0 }
+		_, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageShaderRead)
+		if err == nil || !strings.Contains(err.Error(), "would not give") {
+			t.Errorf("NewTexture with the allocation seam forced to fail: err = %v, want \"would not give\"", err)
+		}
+	})
+
+	// The seams must be exactly restored: a real texture still works after
+	// both subtests clean up.
+	tex, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageShaderRead)
+	if err != nil {
+		t.Fatalf("NewTexture after the seams were restored: %v", err)
+	}
+	tex.Close()
+}
+
+// TestRunRenderSeamFailures drives RunRender's two command-buffer/encoder
+// failure branches through their seams, for the same reason as
+// TestNewTextureSeamFailures: neither native call actually returns nil for
+// a valid, already-validated request.
+func TestRunRenderSeamFailures(t *testing.T) {
+	d := device(t)
+	target, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageRenderTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+
+	t.Run("command buffer refused", func(t *testing.T) {
+		old := newRenderCommandBuffer
+		t.Cleanup(func() { newRenderCommandBuffer = old })
+		newRenderCommandBuffer = func(uintptr) objc.ID { return 0 }
+		err := d.RunRender(RenderPassDescriptor{Target: target, Store: StoreActionStore}, func(*RenderEncoder) {})
+		if err == nil || !strings.Contains(err.Error(), "would not open a command buffer") {
+			t.Errorf("RunRender with the command-buffer seam forced to fail: err = %v, want \"would not open a command buffer\"", err)
+		}
+	})
+
+	t.Run("render encoder refused", func(t *testing.T) {
+		old := newRenderEncoder
+		t.Cleanup(func() { newRenderEncoder = old })
+		newRenderEncoder = func(objc.ID, objc.ID) objc.ID { return 0 }
+		err := d.RunRender(RenderPassDescriptor{Target: target, Store: StoreActionStore}, func(*RenderEncoder) {})
+		if err == nil || !strings.Contains(err.Error(), "would not open a render encoder") {
+			t.Errorf("RunRender with the render-encoder seam forced to fail: err = %v, want \"would not open a render encoder\"", err)
+		}
+	})
+
+	// The seams must be exactly restored: a real render pass still runs
+	// after both subtests clean up.
+	if err := d.RunRender(RenderPassDescriptor{Target: target, Store: StoreActionStore}, func(*RenderEncoder) {}); err != nil {
+		t.Fatalf("RunRender after the seams were restored: %v", err)
 	}
 }
 
