@@ -1,6 +1,7 @@
 package metal
 
 import (
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -349,22 +350,33 @@ func TestRenderAndTextureAPIsRefuseWhatTheyCannotDo(t *testing.T) {
 	if _, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "nope", FragmentFunction: "fmain", ColorFormat: PixelFormatR8Uint}); err == nil {
 		t.Error("a render pipeline built from a missing vertex function")
 	}
-	if _, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "nope", ColorFormat: PixelFormatR8Uint}); err == nil {
-		t.Error("a render pipeline built from a missing fragment function")
+	if _, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "nope", ColorFormat: PixelFormatR8Uint}); err == nil || !strings.Contains(err.Error(), "fragment function") {
+		t.Errorf("a render pipeline built from a missing fragment function: err = %v", err)
 	}
 	if _, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", ColorFormat: PixelFormat(999)}); err == nil {
 		t.Error("a render pipeline built with an unsupported color format")
 	}
-	if _, err := (*Library)(nil).RenderPipeline(RenderPipelineDescriptor{}); err == nil {
-		t.Error("a render pipeline taken from a nil library")
+	// vmain declares a [[stage_in]] attribute(0); a vertex descriptor with
+	// no attributes at all leaves it unbound, which Metal's pipeline
+	// validation refuses at build time rather than at draw time.
+	if _, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", ColorFormat: PixelFormatR8Uint}); err == nil {
+		t.Error("a render pipeline built with no vertex descriptor at all")
+	}
+	// Both the nil- and closed-library cases below use a fully valid
+	// descriptor (color format and function names that really exist in
+	// lib) so the closed-library guard's own error ("closed library") is
+	// the only thing that can produce it -- a masked guard would instead
+	// surface the vertex/fragment-function-not-found error further down.
+	if _, err := (*Library)(nil).RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", ColorFormat: PixelFormatR8Uint}); err == nil || !strings.Contains(err.Error(), "closed library") {
+		t.Errorf("a render pipeline taken from a nil library: err = %v", err)
 	}
 	closedLib, err := d.Compile(renderSource)
 	if err != nil {
 		t.Fatal(err)
 	}
 	closedLib.Close()
-	if _, err := closedLib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", ColorFormat: PixelFormatR8Uint}); err == nil {
-		t.Error("a render pipeline taken from a closed library")
+	if _, err := closedLib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", ColorFormat: PixelFormatR8Uint}); err == nil || !strings.Contains(err.Error(), "closed library") {
+		t.Errorf("a render pipeline taken from a closed library: err = %v", err)
 	}
 	attrs, layouts := quadVertexDescriptor()
 	pipe, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", Attributes: attrs, Layouts: layouts, ColorFormat: PixelFormatR8Uint})
@@ -444,11 +456,19 @@ func TestRenderAndTextureAPIsRefuseWhatTheyCannotDo(t *testing.T) {
 	if _, err := closedDev.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageShaderRead); err == nil {
 		t.Error("a texture made against a closed device")
 	}
-	if err := (*Device)(nil).RunRender(RenderPassDescriptor{}, func(*RenderEncoder) {}); err == nil {
-		t.Error("a render pass run against a nil device")
+	// A real, open target on both calls below: an empty descriptor would
+	// mask the device guard behind "a render pass with no open target",
+	// true either way.
+	realTarget, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageRenderTarget)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := closedDev.RunRender(RenderPassDescriptor{}, func(*RenderEncoder) {}); err == nil {
-		t.Error("a render pass run against a closed device")
+	defer realTarget.Close()
+	if err := (*Device)(nil).RunRender(RenderPassDescriptor{Target: realTarget, Store: StoreActionStore}, func(*RenderEncoder) {}); err == nil || !strings.Contains(err.Error(), "closed device") {
+		t.Errorf("a render pass run against a nil device: err = %v", err)
+	}
+	if err := closedDev.RunRender(RenderPassDescriptor{Target: realTarget, Store: StoreActionStore}, func(*RenderEncoder) {}); err == nil || !strings.Contains(err.Error(), "closed device") {
+		t.Errorf("a render pass run against a closed device: err = %v", err)
 	}
 	if err := d.RunRender(RenderPassDescriptor{Store: StoreActionStore}, func(*RenderEncoder) {}); err == nil {
 		t.Error("a render pass with no target")
