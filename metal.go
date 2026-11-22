@@ -141,6 +141,7 @@ type Texture struct {
 	id     uintptr
 	w, h   int
 	format PixelFormat
+	bpp    int // format's bytes per pixel, resolved once at NewTexture
 }
 
 // Size is the texture size in pixels.

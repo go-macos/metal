@@ -349,6 +349,23 @@ func TestRenderAndTextureAPIsRefuseWhatTheyCannotDo(t *testing.T) {
 	if _, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "nope", FragmentFunction: "fmain", ColorFormat: PixelFormatR8Uint}); err == nil {
 		t.Error("a render pipeline built from a missing vertex function")
 	}
+	if _, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "nope", ColorFormat: PixelFormatR8Uint}); err == nil {
+		t.Error("a render pipeline built from a missing fragment function")
+	}
+	if _, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", ColorFormat: PixelFormat(999)}); err == nil {
+		t.Error("a render pipeline built with an unsupported color format")
+	}
+	if _, err := (*Library)(nil).RenderPipeline(RenderPipelineDescriptor{}); err == nil {
+		t.Error("a render pipeline taken from a nil library")
+	}
+	closedLib, err := d.Compile(renderSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closedLib.Close()
+	if _, err := closedLib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", ColorFormat: PixelFormatR8Uint}); err == nil {
+		t.Error("a render pipeline taken from a closed library")
+	}
 	attrs, layouts := quadVertexDescriptor()
 	pipe, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", Attributes: attrs, Layouts: layouts, ColorFormat: PixelFormatR8Uint})
 	if err != nil {
@@ -369,6 +386,19 @@ func TestRenderAndTextureAPIsRefuseWhatTheyCannotDo(t *testing.T) {
 		{"a closed vertex buffer", func(e *RenderEncoder) { e.Use(pipe); e.VertexBuffer(0, closed2(t, d), 0); e.Draw(3, 1, 0, 0) }},
 		{"a nil index buffer", func(e *RenderEncoder) { e.Use(pipe); e.VertexBuffer(0, vb, 0); e.DrawIndexed(3, 1, nil, 0, 0, 0) }},
 		{"no pipeline at all", func(e *RenderEncoder) { e.Use(nil) }},
+		{"a negative vertex buffer offset", func(e *RenderEncoder) { e.Use(pipe); e.VertexBuffer(0, vb, -1); e.Draw(3, 1, 0, 0) }},
+		{"a vertex buffer offset past its end", func(e *RenderEncoder) { e.Use(pipe); e.VertexBuffer(0, vb, 1<<30); e.Draw(3, 1, 0, 0) }},
+		{"a nil fragment texture", func(e *RenderEncoder) { e.Use(pipe); e.FragmentTexture(0, nil); e.Draw(3, 1, 0, 0) }},
+		{"a closed fragment texture", func(e *RenderEncoder) {
+			e.Use(pipe)
+			ct, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageShaderRead)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ct.Close()
+			e.FragmentTexture(0, ct)
+			e.Draw(3, 1, 0, 0)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			target, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageRenderTarget)
@@ -381,6 +411,76 @@ func TestRenderAndTextureAPIsRefuseWhatTheyCannotDo(t *testing.T) {
 			}
 		})
 	}
+
+	// Close and the two closed/missing-resource guards: a nil receiver and
+	// an already-closed one must both be silent no-ops or plain errors,
+	// never a panic.
+	var nilTex *Texture
+	nilTex.Close()
+	tex2, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageShaderRead)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tex2.Close()
+	tex2.Close() // second Close on an already-closed texture
+	if err := tex2.GetBytes(make([]byte, 4)); err == nil {
+		t.Error("GetBytes read a closed texture")
+	}
+
+	var nilPipe *RenderPipeline
+	nilPipe.Close()
+	pipe2, err := lib.RenderPipeline(RenderPipelineDescriptor{VertexFunction: "vmain", FragmentFunction: "fmain", Attributes: attrs, Layouts: layouts, ColorFormat: PixelFormatR8Uint})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pipe2.Close()
+	pipe2.Close() // second Close on an already-closed pipeline
+
+	if _, err := (*Device)(nil).NewTexture(2, 2, PixelFormatR8Uint, TextureUsageShaderRead); err == nil {
+		t.Error("a texture made against a nil device")
+	}
+	closedDev := device(t)
+	closedDev.Close()
+	if _, err := closedDev.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageShaderRead); err == nil {
+		t.Error("a texture made against a closed device")
+	}
+	if err := (*Device)(nil).RunRender(RenderPassDescriptor{}, func(*RenderEncoder) {}); err == nil {
+		t.Error("a render pass run against a nil device")
+	}
+	if err := closedDev.RunRender(RenderPassDescriptor{}, func(*RenderEncoder) {}); err == nil {
+		t.Error("a render pass run against a closed device")
+	}
+	if err := d.RunRender(RenderPassDescriptor{Store: StoreActionStore}, func(*RenderEncoder) {}); err == nil {
+		t.Error("a render pass with no target")
+	}
+	noTargetTex, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageRenderTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noTargetTex.Close()
+	if err := d.RunRender(RenderPassDescriptor{Target: noTargetTex, Store: StoreActionStore}, func(*RenderEncoder) {}); err == nil {
+		t.Error("a render pass targeting a closed texture")
+	}
+
+	// An encoder escaped past the RunRender call that created it: every
+	// method must silently do nothing rather than send a stale id to a
+	// command buffer already committed and gone.
+	var escaped *RenderEncoder
+	escapedTarget, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageRenderTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer escapedTarget.Close()
+	if err := d.RunRender(RenderPassDescriptor{Target: escapedTarget, Store: StoreActionStore}, func(e *RenderEncoder) {
+		escaped = e
+	}); err != nil {
+		t.Fatal(err)
+	}
+	escaped.Use(pipe)
+	escaped.VertexBuffer(0, vb, 0)
+	escaped.FragmentTexture(0, escapedTarget)
+	escaped.Draw(3, 1, 0, 0)
+	escaped.DrawIndexed(3, 1, ib, 0, 0, 0)
 }
 
 // closed2 hands back an already-closed buffer, for the table above.

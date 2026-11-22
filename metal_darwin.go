@@ -503,11 +503,11 @@ func (d *Device) NewTexture(w, h int, format PixelFormat, usage TextureUsage) (*
 	if err := checkTextureSize(w, h); err != nil {
 		return nil, err
 	}
-	if _, err := bytesPerPixel(format); err != nil {
+	bpp, err := bytesPerPixel(format)
+	if err != nil {
 		return nil, err
 	}
 	var tex *Texture
-	var err error
 	objc.AutoreleasePool(func() {
 		desc := objc.ClassID("MTLTextureDescriptor").Send(
 			objc.Sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
@@ -523,7 +523,7 @@ func (d *Device) NewTexture(w, h int, format PixelFormat, usage TextureUsage) (*
 			err = fmt.Errorf("metal: the GPU would not give a %d x %d texture", w, h)
 			return
 		}
-		tex = &Texture{id: uintptr(t), w: w, h: h, format: format}
+		tex = &Texture{id: uintptr(t), w: w, h: h, format: format, bpp: bpp}
 	})
 	return tex, err
 }
@@ -550,17 +550,13 @@ func (t *Texture) Replace(data []byte) error {
 	if t == nil || t.id == 0 {
 		return fmt.Errorf("metal: writing to a closed or missing texture")
 	}
-	bpp, err := bytesPerPixel(t.format)
-	if err != nil {
-		return err
-	}
-	if want := t.w * t.h * bpp; len(data) != want {
+	if want := t.w * t.h * t.bpp; len(data) != want {
 		return fmt.Errorf("metal: writing %d bytes to a texture that needs exactly %d", len(data), want)
 	}
 	objc.AutoreleasePool(func() {
 		region := mtlRegion{Size: mtlSize{uint64(t.w), uint64(t.h), 1}}
 		objc.ID(t.id).Send(objc.Sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
-			region, uintptr(0), unsafe.Pointer(&data[0]), uintptr(t.w*bpp))
+			region, uintptr(0), unsafe.Pointer(&data[0]), uintptr(t.w*t.bpp))
 	})
 	return nil
 }
@@ -572,17 +568,13 @@ func (t *Texture) GetBytes(dst []byte) error {
 	if t == nil || t.id == 0 {
 		return fmt.Errorf("metal: reading a closed or missing texture")
 	}
-	bpp, err := bytesPerPixel(t.format)
-	if err != nil {
-		return err
-	}
-	if want := t.w * t.h * bpp; len(dst) != want {
+	if want := t.w * t.h * t.bpp; len(dst) != want {
 		return fmt.Errorf("metal: reading %d bytes from a texture that holds exactly %d", len(dst), want)
 	}
 	objc.AutoreleasePool(func() {
 		region := mtlRegion{Size: mtlSize{uint64(t.w), uint64(t.h), 1}}
 		objc.ID(t.id).Send(objc.Sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
-			unsafe.Pointer(&dst[0]), uintptr(t.w*bpp), region, uintptr(0))
+			unsafe.Pointer(&dst[0]), uintptr(t.w*t.bpp), region, uintptr(0))
 	})
 	return nil
 }
