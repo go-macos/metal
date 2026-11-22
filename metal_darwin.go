@@ -716,6 +716,7 @@ func (e *RenderEncoder) Use(p *RenderPipeline) {
 // b.Bytes()[offset:].
 func (e *RenderEncoder) VertexBuffer(index int, b *Buffer, offset int) {
 	if e.id == 0 {
+		e.fail(fmt.Errorf("metal: VertexBuffer on a render encoder past its RunRender call"))
 		return
 	}
 	if b == nil || b.id == 0 {
@@ -733,6 +734,7 @@ func (e *RenderEncoder) VertexBuffer(index int, b *Buffer, offset int) {
 // shader's signature.
 func (e *RenderEncoder) FragmentTexture(index int, t *Texture) {
 	if e.id == 0 {
+		e.fail(fmt.Errorf("metal: FragmentTexture on a render encoder past its RunRender call"))
 		return
 	}
 	if t == nil || t.id == 0 {
@@ -752,6 +754,7 @@ const mtlPrimitiveTypeTriangle = 3
 // restricted (like this whole package) to triangle-list.
 func (e *RenderEncoder) Draw(vertexCount, instanceCount, firstVertex, firstInstance int) {
 	if e.id == 0 {
+		e.fail(fmt.Errorf("metal: Draw on a render encoder past its RunRender call"))
 		return
 	}
 	if e.pipe == nil {
@@ -772,6 +775,7 @@ const mtlIndexTypeUInt32 = 1
 // WebGPU's drawIndexed.
 func (e *RenderEncoder) DrawIndexed(indexCount, instanceCount int, indexBuffer *Buffer, indexBufferOffset, baseVertex, firstInstance int) {
 	if e.id == 0 {
+		e.fail(fmt.Errorf("metal: DrawIndexed on a render encoder past its RunRender call"))
 		return
 	}
 	if e.pipe == nil {

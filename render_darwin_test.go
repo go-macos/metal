@@ -483,8 +483,10 @@ func TestRenderAndTextureAPIsRefuseWhatTheyCannotDo(t *testing.T) {
 	}
 
 	// An encoder escaped past the RunRender call that created it: every
-	// method must silently do nothing rather than send a stale id to a
-	// command buffer already committed and gone.
+	// method must record a failure (checked here through the package's
+	// own escaped.err, since nothing public ever reads it this late)
+	// rather than send a stale id to a command buffer already committed
+	// and gone.
 	var escaped *RenderEncoder
 	escapedTarget, err := d.NewTexture(2, 2, PixelFormatR8Uint, TextureUsageRenderTarget)
 	if err != nil {
@@ -496,11 +498,30 @@ func TestRenderAndTextureAPIsRefuseWhatTheyCannotDo(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	escaped.Use(pipe)
 	escaped.VertexBuffer(0, vb, 0)
+	if escaped.err == nil || !strings.Contains(escaped.err.Error(), "past its RunRender call") {
+		t.Errorf("VertexBuffer on an escaped encoder: err = %v", escaped.err)
+	}
+	escaped.err = nil
 	escaped.FragmentTexture(0, escapedTarget)
+	if escaped.err == nil || !strings.Contains(escaped.err.Error(), "past its RunRender call") {
+		t.Errorf("FragmentTexture on an escaped encoder: err = %v", escaped.err)
+	}
+	escaped.err = nil
 	escaped.Draw(3, 1, 0, 0)
+	if escaped.err == nil || !strings.Contains(escaped.err.Error(), "past its RunRender call") {
+		t.Errorf("Draw on an escaped encoder: err = %v", escaped.err)
+	}
+	escaped.err = nil
 	escaped.DrawIndexed(3, 1, ib, 0, 0, 0)
+	if escaped.err == nil || !strings.Contains(escaped.err.Error(), "past its RunRender call") {
+		t.Errorf("DrawIndexed on an escaped encoder: err = %v", escaped.err)
+	}
+	escaped.err = nil
+	escaped.Use(pipe)
+	if escaped.err == nil {
+		t.Error("Use on an escaped encoder")
+	}
 }
 
 // closed2 hands back an already-closed buffer, for the table above.
