@@ -447,6 +447,374 @@ func (e *Encoder) Dispatch(dims ...int) {
 		uintptr(unsafe.Pointer(&tg)), uintptr(unsafe.Pointer(&per)))
 }
 
+// mtlOrigin is Metal's three-axis texture coordinate (MTLOrigin.h).
+type mtlOrigin struct{ X, Y, Z uint64 }
+
+// mtlRegion is an MTLOrigin plus an mtlSize: 48 bytes (MTLTypes.h). Like
+// mtlSize it is too big to go through Msg, so Replace and GetBytes pass it
+// as a struct VALUE through Send -- the same pattern layer_darwin.go's
+// resize already uses for objc.NSSize, which is why that call is proof this
+// one works rather than a guess.
+type mtlRegion struct {
+	Origin mtlOrigin
+	Size   mtlSize
+}
+
+// mtlClearColor is Metal's four-channel clear colour (MTLRenderPass.h), 32
+// bytes, passed to setClearColor: the same way.
+type mtlClearColor struct{ R, G, B, A float64 }
+
+// mtlStorageModeShared is MTLStorageModeShared (MTLResource.h): CPU and GPU
+// read and write the same bytes, with no blit between them -- the only mode
+// this package uses, exactly as NewBuffer already assumes for buffers.
+const mtlStorageModeShared = 0
+
+// bytesPerPixel is how many bytes one pixel of format takes, or an error
+// for a format this package does not support. It is the one place that
+// knows the sizes, so Replace, GetBytes and NewTexture cannot disagree.
+func bytesPerPixel(f PixelFormat) (int, error) {
+	switch f {
+	case PixelFormatR8Uint:
+		return 1, nil
+	default:
+		return 0, fmt.Errorf("metal: pixel format %d is not one this package supports", int(f))
+	}
+}
+
+// checkTextureSize reuses MaxLayerSide: it is documented as the largest 2D
+// texture an Apple GPU makes, a bound that is not specific to a drawable.
+func checkTextureSize(w, h int) error {
+	if w < 1 || h < 1 || w > MaxLayerSide || h > MaxLayerSide {
+		return fmt.Errorf("metal: a %d x %d texture (each side must be 1 to %d)", w, h, MaxLayerSide)
+	}
+	return nil
+}
+
+// newTextureDescriptor is a seam so a test can force NewTexture's
+// describe-failure branch without the system ever actually refusing one.
+var newTextureDescriptor = func(format PixelFormat, w, h int) objc.ID {
+	return objc.ClassID("MTLTextureDescriptor").Send(
+		objc.Sel("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"),
+		uintptr(format), uintptr(w), uintptr(h), uintptr(0))
+}
+
+// newTextureFromDescriptor is a seam so a test can force NewTexture's
+// allocation-failure branch without the GPU ever actually refusing one.
+var newTextureFromDescriptor = func(device, desc objc.ID) objc.ID {
+	return device.Send(objc.Sel("newTextureWithDescriptor:"), desc)
+}
+
+// NewTexture allocates a 2D texture the GPU can render into, read in a
+// shader, or both, depending on usage. Its storage mode is always Shared:
+// every device this package opens has unified memory (see UnifiedMemory),
+// so Replace and GetBytes touch the same bytes the GPU does, with no blit.
+// See Default's own doc comment for why this runs inside
+// objc.AutoreleasePool.
+func (d *Device) NewTexture(w, h int, format PixelFormat, usage TextureUsage) (*Texture, error) {
+	if d == nil || d.id == 0 {
+		return nil, fmt.Errorf("metal: making a texture against a closed device")
+	}
+	if err := checkTextureSize(w, h); err != nil {
+		return nil, err
+	}
+	bpp, err := bytesPerPixel(format)
+	if err != nil {
+		return nil, err
+	}
+	var tex *Texture
+	objc.AutoreleasePool(func() {
+		desc := newTextureDescriptor(format, w, h)
+		if desc == 0 {
+			err = fmt.Errorf("metal: the system would not describe a %d x %d texture", w, h)
+			return
+		}
+		desc.Send(objc.Sel("setUsage:"), uintptr(usage))
+		desc.Send(objc.Sel("setStorageMode:"), uintptr(mtlStorageModeShared))
+		t := newTextureFromDescriptor(objc.ID(d.id), desc)
+		if t == 0 {
+			err = fmt.Errorf("metal: the GPU would not give a %d x %d texture", w, h)
+			return
+		}
+		tex = &Texture{id: uintptr(t), w: w, h: h, format: format, bpp: bpp}
+	})
+	return tex, err
+}
+
+// Close releases the texture. A texture Present hands over needs no Close
+// of its own: its id is already zero by the time Present's fn returns. See
+// Default's own doc comment for why this runs inside objc.AutoreleasePool.
+func (t *Texture) Close() {
+	if t == nil || t.id == 0 {
+		return
+	}
+	objc.AutoreleasePool(func() {
+		objc.ID(t.id).Send(objc.Sel("release"))
+	})
+	t.id = 0
+}
+
+// Replace overwrites the whole texture from data, tightly packed, row by
+// row, top to bottom, at mip level 0 -- WebGPU's queue.writeTexture,
+// restricted to one full-extent write, which is all this package's caller
+// needs. len(data) must be exactly width * height * the format's bytes per
+// pixel.
+func (t *Texture) Replace(data []byte) error {
+	if t == nil || t.id == 0 {
+		return fmt.Errorf("metal: writing to a closed or missing texture")
+	}
+	if want := t.w * t.h * t.bpp; len(data) != want {
+		return fmt.Errorf("metal: writing %d bytes to a texture that needs exactly %d", len(data), want)
+	}
+	objc.AutoreleasePool(func() {
+		region := mtlRegion{Size: mtlSize{uint64(t.w), uint64(t.h), 1}}
+		objc.ID(t.id).Send(objc.Sel("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"),
+			region, uintptr(0), unsafe.Pointer(&data[0]), uintptr(t.w*t.bpp))
+	})
+	return nil
+}
+
+// GetBytes reads the whole texture into dst, tightly packed, row by row,
+// top to bottom, at mip level 0 -- the same layout Replace writes. len(dst)
+// must be exactly width * height * the format's bytes per pixel.
+func (t *Texture) GetBytes(dst []byte) error {
+	if t == nil || t.id == 0 {
+		return fmt.Errorf("metal: reading a closed or missing texture")
+	}
+	if want := t.w * t.h * t.bpp; len(dst) != want {
+		return fmt.Errorf("metal: reading %d bytes from a texture that holds exactly %d", len(dst), want)
+	}
+	objc.AutoreleasePool(func() {
+		region := mtlRegion{Size: mtlSize{uint64(t.w), uint64(t.h), 1}}
+		objc.ID(t.id).Send(objc.Sel("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+			unsafe.Pointer(&dst[0]), uintptr(t.w*t.bpp), region, uintptr(0))
+	})
+	return nil
+}
+
+// RenderPipeline builds a vertex/fragment pipeline from two of this
+// library's functions, wired to desc's vertex layout and color format. See
+// Default's own doc comment for why this runs inside objc.AutoreleasePool
+// (the `error:` out-parameter here is autoreleased too).
+func (l *Library) RenderPipeline(desc RenderPipelineDescriptor) (*RenderPipeline, error) {
+	if l == nil || l.id == 0 {
+		return nil, fmt.Errorf("metal: taking a render pipeline from a closed library")
+	}
+	if _, err := bytesPerPixel(desc.ColorFormat); err != nil {
+		return nil, err
+	}
+	var pipe *RenderPipeline
+	var err error
+	objc.AutoreleasePool(func() {
+		vfn := objc.ID(l.id).Send(objc.Sel("newFunctionWithName:"), objc.NSString(desc.VertexFunction))
+		if vfn == 0 {
+			err = fmt.Errorf("metal: this library has no vertex function called %q", desc.VertexFunction)
+			return
+		}
+		defer vfn.Send(objc.Sel("release"))
+		ffn := objc.ID(l.id).Send(objc.Sel("newFunctionWithName:"), objc.NSString(desc.FragmentFunction))
+		if ffn == 0 {
+			err = fmt.Errorf("metal: this library has no fragment function called %q", desc.FragmentFunction)
+			return
+		}
+		defer ffn.Send(objc.Sel("release"))
+
+		vd := objc.ClassID("MTLVertexDescriptor").Send(objc.Sel("vertexDescriptor"))
+		attrs := vd.Send(objc.Sel("attributes"))
+		for _, a := range desc.Attributes {
+			ad := attrs.Send(objc.Sel("objectAtIndexedSubscript:"), uintptr(a.Index))
+			ad.Send(objc.Sel("setFormat:"), uintptr(a.Format))
+			ad.Send(objc.Sel("setOffset:"), uintptr(a.Offset))
+			ad.Send(objc.Sel("setBufferIndex:"), uintptr(a.BufferIndex))
+		}
+		layouts := vd.Send(objc.Sel("layouts"))
+		for _, vl := range desc.Layouts {
+			ld := layouts.Send(objc.Sel("objectAtIndexedSubscript:"), uintptr(vl.BufferIndex))
+			ld.Send(objc.Sel("setStride:"), uintptr(vl.Stride))
+		}
+
+		rpd := objc.ClassID("MTLRenderPipelineDescriptor").Send(objc.Sel("alloc")).Send(objc.Sel("init"))
+		rpd.Send(objc.Sel("setVertexFunction:"), vfn)
+		rpd.Send(objc.Sel("setFragmentFunction:"), ffn)
+		rpd.Send(objc.Sel("setVertexDescriptor:"), vd)
+		colorAttachments := rpd.Send(objc.Sel("colorAttachments"))
+		ca0 := colorAttachments.Send(objc.Sel("objectAtIndexedSubscript:"), uintptr(0))
+		ca0.Send(objc.Sel("setPixelFormat:"), uintptr(desc.ColorFormat))
+
+		var nsErr objc.ID
+		p := objc.ID(l.dev.id).Send(objc.Sel("newRenderPipelineStateWithDescriptor:error:"), rpd, unsafe.Pointer(&nsErr))
+		if p == 0 {
+			err = fmt.Errorf("metal: %s", describe(nsErr, "the render pipeline would not build"))
+			return
+		}
+		pipe = &RenderPipeline{id: uintptr(p)}
+	})
+	return pipe, err
+}
+
+// Close releases the pipeline. See Default's own doc comment.
+func (p *RenderPipeline) Close() {
+	if p == nil || p.id == 0 {
+		return
+	}
+	objc.AutoreleasePool(func() {
+		objc.ID(p.id).Send(objc.Sel("release"))
+	})
+	p.id = 0
+}
+
+// newRenderCommandBuffer is a seam so a test can force RunRender's
+// command-buffer failure branch without the queue ever actually refusing one.
+var newRenderCommandBuffer = func(queue uintptr) objc.ID {
+	return objc.ID(objc.Msg0(objc.ID(queue), objc.Sel("commandBuffer")))
+}
+
+// newRenderEncoder is a seam so a test can force RunRender's encoder-failure
+// branch without the command buffer ever actually refusing one.
+var newRenderEncoder = func(cb, rpd objc.ID) objc.ID {
+	return cb.Send(objc.Sel("renderCommandEncoderWithDescriptor:"), rpd)
+}
+
+// RunRender opens a render pass against desc.Target, records the draws fn
+// describes, and waits for the GPU to finish. Run's own doc comment about
+// scope applies identically: encode, end, commit, wait, with no way to hold
+// the encoder past this call.
+func (d *Device) RunRender(desc RenderPassDescriptor, fn func(*RenderEncoder)) error {
+	if d == nil || d.id == 0 {
+		return fmt.Errorf("metal: running against a closed device")
+	}
+	if desc.Target == nil || desc.Target.id == 0 {
+		return fmt.Errorf("metal: a render pass with no open target")
+	}
+	var err error
+	objc.AutoreleasePool(func() {
+		rpd := objc.ClassID("MTLRenderPassDescriptor").Send(objc.Sel("renderPassDescriptor"))
+		colorAttachments := rpd.Send(objc.Sel("colorAttachments"))
+		ca0 := colorAttachments.Send(objc.Sel("objectAtIndexedSubscript:"), uintptr(0))
+		ca0.Send(objc.Sel("setTexture:"), objc.ID(desc.Target.id))
+		ca0.Send(objc.Sel("setLoadAction:"), uintptr(desc.Load))
+		ca0.Send(objc.Sel("setStoreAction:"), uintptr(desc.Store))
+		if desc.Load == LoadActionClear {
+			cc := mtlClearColor{desc.Clear[0], desc.Clear[1], desc.Clear[2], desc.Clear[3]}
+			ca0.Send(objc.Sel("setClearColor:"), cc)
+		}
+
+		cb := newRenderCommandBuffer(d.queue)
+		if cb == 0 {
+			err = fmt.Errorf("metal: the queue would not open a command buffer")
+			return
+		}
+		re := newRenderEncoder(cb, rpd)
+		if re == 0 {
+			err = fmt.Errorf("metal: the command buffer would not open a render encoder")
+			return
+		}
+		e := &RenderEncoder{id: uintptr(re)}
+		fn(e)
+		objc.Msg0(objc.ID(e.id), objc.Sel("endEncoding"))
+		e.id = 0
+		if e.err != nil {
+			err = e.err
+			return
+		}
+		objc.Msg0(cb, objc.Sel("commit"))
+		objc.Msg0(cb, objc.Sel("waitUntilCompleted"))
+		if nsErr := objc.ID(objc.Msg0(cb, objc.Sel("error"))); nsErr != 0 {
+			err = fmt.Errorf("metal: %s", describe(nsErr, "the GPU refused the render"))
+		}
+	})
+	return err
+}
+
+// Use selects the pipeline the next Draw or DrawIndexed runs.
+func (e *RenderEncoder) Use(p *RenderPipeline) {
+	if e.id == 0 || p == nil || p.id == 0 {
+		e.fail(fmt.Errorf("metal: Use was given no render pipeline"))
+		return
+	}
+	e.pipe = p
+	objc.Msg1(objc.ID(e.id), objc.Sel("setRenderPipelineState:"), p.id)
+}
+
+// VertexBuffer binds b at the given vertex buffer index, starting offset
+// bytes into b: the vertex shader's [[buffer(index)]] argument reads
+// b.Bytes()[offset:].
+func (e *RenderEncoder) VertexBuffer(index int, b *Buffer, offset int) {
+	if e.id == 0 {
+		e.fail(fmt.Errorf("metal: VertexBuffer on a render encoder past its RunRender call"))
+		return
+	}
+	if b == nil || b.id == 0 {
+		e.fail(fmt.Errorf("metal: vertex buffer %d is closed or missing", index))
+		return
+	}
+	if offset < 0 || offset > len(b.mem) {
+		e.fail(fmt.Errorf("metal: vertex buffer %d offset %d is out of range for a %d-byte buffer", index, offset, len(b.mem)))
+		return
+	}
+	objc.Msg3(objc.ID(e.id), objc.Sel("setVertexBuffer:offset:atIndex:"), b.id, uintptr(offset), uintptr(index))
+}
+
+// FragmentTexture binds t at the given texture index of the fragment
+// shader's signature.
+func (e *RenderEncoder) FragmentTexture(index int, t *Texture) {
+	if e.id == 0 {
+		e.fail(fmt.Errorf("metal: FragmentTexture on a render encoder past its RunRender call"))
+		return
+	}
+	if t == nil || t.id == 0 {
+		e.fail(fmt.Errorf("metal: fragment texture %d is missing", index))
+		return
+	}
+	objc.Msg2(objc.ID(e.id), objc.Sel("setFragmentTexture:atIndex:"), t.id, uintptr(index))
+}
+
+// mtlPrimitiveTypeTriangle is MTLPrimitiveTypeTriangle
+// (MTLRenderCommandEncoder.h): the only primitive this package's callers
+// draw with so far.
+const mtlPrimitiveTypeTriangle = 3
+
+// Draw draws vertexCount vertices starting at firstVertex, instanceCount
+// times, with firstInstance as the first instance ID -- WebGPU's draw,
+// restricted (like this whole package) to triangle-list.
+func (e *RenderEncoder) Draw(vertexCount, instanceCount, firstVertex, firstInstance int) {
+	if e.id == 0 {
+		e.fail(fmt.Errorf("metal: Draw on a render encoder past its RunRender call"))
+		return
+	}
+	if e.pipe == nil {
+		e.fail(fmt.Errorf("metal: Draw before Use"))
+		return
+	}
+	objc.ID(e.id).Send(objc.Sel("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
+		uintptr(mtlPrimitiveTypeTriangle), uintptr(firstVertex), uintptr(vertexCount), uintptr(instanceCount), uintptr(firstInstance))
+}
+
+// mtlIndexTypeUInt32 is MTLIndexTypeUInt32 (MTLArgument.h): the only index
+// width WebGPU's setIndexBuffer("uint32") needs.
+const mtlIndexTypeUInt32 = 1
+
+// DrawIndexed draws indexCount indices from indexBuffer (uint32 indices,
+// starting indexBufferOffset bytes in), instanceCount times, adding
+// baseVertex to every index and firstInstance to every instance ID --
+// WebGPU's drawIndexed.
+func (e *RenderEncoder) DrawIndexed(indexCount, instanceCount int, indexBuffer *Buffer, indexBufferOffset, baseVertex, firstInstance int) {
+	if e.id == 0 {
+		e.fail(fmt.Errorf("metal: DrawIndexed on a render encoder past its RunRender call"))
+		return
+	}
+	if e.pipe == nil {
+		e.fail(fmt.Errorf("metal: DrawIndexed before Use"))
+		return
+	}
+	if indexBuffer == nil || indexBuffer.id == 0 {
+		e.fail(fmt.Errorf("metal: DrawIndexed with a closed or missing index buffer"))
+		return
+	}
+	objc.ID(e.id).Send(objc.Sel("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:baseInstance:"),
+		uintptr(mtlPrimitiveTypeTriangle), uintptr(indexCount), uintptr(mtlIndexTypeUInt32), objc.ID(indexBuffer.id),
+		uintptr(indexBufferOffset), uintptr(instanceCount), uintptr(baseVertex), uintptr(firstInstance))
+}
+
 func describe(nsErr objc.ID, fallback string) string {
 	if nsErr == 0 {
 		return fallback
